@@ -1,0 +1,416 @@
+---
+title: "Predicting Financial Market Volatility with Google Domestic Trends"
+author: "Wei Wu"
+date: "November 14, 2018"
+output: 
+  pdf_document:
+    toc: true
+    citation_package: natbib
+bibliography: biblio.bib
+fontsize: 14pt
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F)
+knitr::opts_chunk$set(warning = F)
+#knitr::opts_knit$set(root.dir=normalizePath('~/getDocuments/2018Fall/STAT410/project'))
+
+# pacman is a neat little package that automates packages installation and importing 
+if (!require("pacman")) install.packages("pacman")
+
+pacman::p_load('stringr',
+               'tinytex',
+               'zoo',
+               'xtable',
+               'knitr',
+               'GGally',
+               'ggplot2',
+               'astsa',
+               'reshape',
+               'scales',
+               'gridExtra',
+               'forecast',
+               'tseries',
+               'bibtex',
+               'rpivotTable',
+               'party',
+               'DataCombine',
+               'MLmetrics',
+               'quantmod',
+               'data.table',
+               'glmnet',
+               'knitr',
+               'caret',
+               'anytime',
+               'tools',
+               'latex2exp')
+```
+
+```{r, echo=FALSE, out.width="220px", fig.align='center'}
+knitr::include_graphics("./controlling-volatility.jpg")
+```
+
+\pagebreak
+
+# Introduction
+When stock traders talk about “the market”, they are often referring to the movement of the largest publicly
+traded stocks. Indices are metrics used by the financial world to track markets, or subsets of the market, in
+order to determine the aggregate movement of the selected companies. While there are many ways to track
+this so called “market”, the most commonly used metric for measuring the performance of the American
+stock market is the S&P 500.
+
+For this project, I propose to predict S&P 500 market volatility on a daily granularity. Volatility is the range of price change a security (a tradable financial instrument) experiences over a given period of time. If the price stays relatively stable, the security has low
+volatility. A highly volatile security is one that hits new highs and lows, moves erratically, and experiences
+rapid increases and dramatic falls.
+
+The S&P 500 market data, publicly available on Yahoo Yah, comprises of high, low, close, open (HLCO),
+adjusted closed, and volume of each trading day. A daily volatility is estimated using HLCO with the following equations:
+
+$u = log(Hi/Op), d = log(Lo/Op), c = log(Cl/Op)$
+
+$\sigma = 0.511(u-d)^2 - 0.019[c(u+d) - 2ud] - 0.383c^2$
+
+
+HLCO, adjusted closed, and volume will serves as our model features. In addition, inspisred by \cite{xiong2015deep}, I will use Google Trend, Google’s collection of search queries popularities, as indicators of macroeconomics to supplement the financial features.
+Rolling linear regressions and LASSO regression with lag by one day will be applied to predict daily volatility. Models performnace will be compared visually and quantatively. 
+
+\pagebreak
+
+
+# Data Collection and Data Wrangling
+The Yahoo Finance data and Google Trends data are public available online. However, for this project, we obtained the data from the following Github Repo: https://github.com/philipperemy/stock-volatility-google-trends. Goole has stopped providing daily search trends data for period larger than 90 days. A convinient Python script to scrap Google Trends data can be found at this Github Repo: https://github.com/GeneralMills/pytrends.
+
+```{r}
+# Load Market Data
+tickers <- read.csv("./all data/SP500.csv",stringsAsFactors = FALSE)
+tickers$Date <- as.Date(tickers$Date,"%d-%B-%y")
+tickers$Open <- as.numeric(tickers$Open)
+tickers$Close <- as.numeric(tickers$Close)
+tickers$High <- as.numeric(tickers$High)
+tickers$Low <- as.numeric(tickers$Low)
+```
+
+
+
+```{r}
+# Compute sigma
+tickers$u <- log(tickers$High/tickers$Open)
+tickers$d <- log(tickers$Low/tickers$Open)
+tickers$c <- log(tickers$Close/tickers$Open)
+tickers$sigma <- 0.511*(tickers$u-tickers$d)^2 - 0.019*(tickers$c*(tickers$u+tickers$d)-2*tickers$u*tickers$d)-0.383*tickers$c^2
+tickers <- tickers[, !(names(tickers) %in% c("c","u","d"))]
+```
+The collected SP500 data contains Open, High, Low, Close, and Volume for each market day. There are in total 2756 data points, ranging from 2006-10-23 to 2017-10-05. After calculating the daily volatility $sigma$, our daily volatility is typically at the scale of $10^{-6}$. For this project, we later scaled daily volatility by $10^6$. We also later normalized trade volume by comuting the z-score.
+
+```{r,results='asis'}
+kable(tickers[10:15,], caption = "Tickers Data")
+```
+
+
+
+
+The Google Trends data indicates relavtive search intensity for a certain keyword during a period of time. The trend intensity are normalized. We included 24 Goolge Trends, listed below: 
+
+```{r}
+trend_abbr <- matrix(c(
+'advertising & marketing',
+'air travel',
+"auto buyers",
+"auto financing",
+"business & industrial",
+"bankruptcy",
+"computers & electronics",
+"credit cards",
+"durable goods",
+"education",
+"finance & investing",
+"financial planning",
+"furniture",
+"insurance",
+"jobs",
+"luxury goods",
+"mobile & wireless",
+"mortgage",
+"real estate",
+"rental",
+"shopping",
+"small business",
+"travel",
+"unemployment",
+"advert",
+"airtvl",
+"autoby",
+"autofi",
+"bizind",
+"bnkrpt",
+"comput",
+"crcard",
+"durble",
+"educat",
+"invest",
+"finpln",
+"furntr",
+"insur",
+"jobs",
+"luxury",
+"mobile",
+"mrtge",
+"rlest",
+"rental",
+"shop",
+"smallbiz",
+"travel",
+"unempl"), ncol =2)
+
+colnames(trend_abbr) <- c("Trend","Abbreviation")
+kable(trend_abbr, caption = "Google Trends & Abbreviation")
+```
+
+
+
+```{r}
+# Load Google Trends Data
+myFiles <- file_path_sans_ext(list.files(path = "./all data/", pattern = "*.csv"))
+L <- setdiff(myFiles, c("SP500"))
+
+O = lapply(L, function(x) {
+           DF <- read.csv(paste("./all data/",x,".csv", sep =""),stringsAsFactors = FALSE)
+           #DF$Date <- as.character(CAN$Date)
+           DF$Date <- as.Date(DF$Date, format ="%d-%B-%y")
+           DF <- DF[c("Date", "Close")]
+           colnames(DF) <- c("Date", x)
+           #DF_Merge <- merge(all.dates.frame, CAN, all = T)
+           #DF_Merge$Bid.Yield.To.Maturity <- NULL
+           return(DF)})
+all_trends <- Reduce(function(x,y) merge(x,y,by="Date"),O)
+
+
+# Get all Data
+all_data <- merge(tickers, all_trends, by="Date", all.x=TRUE)
+dates <- all_data$Date
+#format(all_data$Date, format = "%B %d %Y")
+
+# Fill Missing Value
+all_data[is.na(all_data)] <- 0
+
+# Compute Return
+all_data$return <- c(0, (all_data$Close[-1] - all_data$Close[-length(all_data$Close)]) / all_data$Close[-length(all_data$Close)] )
+```
+
+```{r}
+# Scale sigma 
+sigma_sclae <- 10^6
+all_data$sigma <- all_data$sigma*sigma_sclae
+
+# normalize volume
+all_data$Volume <- (all_data$Volume - mean(all_data$Volume))/sd(all_data$Volume) 
+```
+
+```{r,results='asis'}
+kable(all_trends[1:5,1:8], caption = "Google Trends Data")
+```
+
+```{r}
+# Function used to lag data
+lag_data <- function(df, lags){
+  sigma <- df$sigma[-c(1:lags)]
+  lagged_data <- as.data.frame(sigma)
+  for (lag in 1:lags) {
+    x <- df[-c((0:(lags - lag)), (nrow(df) - lag + 1):nrow(df)),]
+    colnames(x) <- paste0(colnames(x), "_Lag", as.character(lag))
+    lagged_data <- as.data.frame(cbind(lagged_data, x))
+  }
+  lagged_data[,] <- lapply(lagged_data[,], as.character)
+  lagged_data[,] <- lapply(lagged_data[,], as.numeric)
+  lagged_data <- Filter(function(x)!all(is.na(x)), lagged_data)
+  return(lagged_data)
+}
+
+```
+
+\pagebreak
+
+# Exploratory Data Analysis
+We first examine our entire volatility data. We can see from the plot that the volatility is highly non-stationary, and there is no apparent seansonality.  
+```{r}
+daily_sigma <- ggplot(all_data, aes(x = Date, y = sigma)) + geom_line(color = "blue") + ylab(TeX("Volatility $\\times 10^{-6$} "))
+daily_sigma
+```
+
+\pagebreak
+
+Next we visually examine the correlation of market volatility and Goolge Trend. Below are the plots for volatility and search volume for keyword "Bankruptcy"" between years 2008 and 2010. As the market became volatile, the search volume for "Bankruptcy" surged.   
+```{r, warning= FALSE}
+daily_sigma <- ggplot(subset(all_data, Date < as.Date("2010-01-01") & Date > as.Date("2008-01-01")), aes(x = Date, y = sigma)) + geom_line(color = "blue") + ylab(TeX("Volatility $\\times 10^{-6$} "))
+bankrupt_trend <- ggplot(subset(all_data, Date < as.Date("2010-01-01") & Date > as.Date("2008-01-01")), aes(x = Date, y = bnkrpt)) + geom_line(color = "red") + ylab("Search Vol. Bankruptcy")
+
+#daily_sigma
+
+grid.arrange(daily_sigma, bankrupt_trend, nrow = 2, ncol=1)
+```
+
+\pagebreak
+
+# Modeling
+
+## Spliting Data
+We first subset our data set into Training and Testing. Training data ranges from 2006-10-23 to 2017-10-05, and Testing ranges from 2016-01-02 to 2017-10-05. The Training data was further subset to have a portion Validation, ranging from 2015-01-02 to 2016-01-01. The Validation data is used by LASSO to select an optimal penalty constant. The Testing data set is held out to compare models. A rolling scheme is applied when fitting the data. The R package "caret" comes in handy for performing rolling regression.    
+
+```{r}
+training <- subset(all_data, Date <= as.Date("2015-01-01"))
+validation <- subset(all_data, Date >= as.Date("2015-01-01") & Date <= as.Date("2016-01-01"))
+testing <- subset(all_data, Date >= as.Date("2016-01-01"))
+```
+
+
+
+## Rolling Linear Regression
+We first train a linear regression model with no intercept on the the entire training set, and test our linear regression model on testing data set. The significant coefficients, with each's p-value smaller than 0.05, is described in the following table. 
+```{r}
+intcpt = 0 # change this to 1 to include intercept
+num_of_lags <- 1
+training_and_validation <- rbind(training,validation)
+
+fitControl_fixedWindow <- trainControl(method = "timeslice",
+                              initialWindow = dim(training_and_validation)[1],
+                              horizon = 1,
+                              fixedWindow = TRUE,
+                              savePredictions = T)
+
+rolling_LM_Fit <- train(sigma ~ ., data = lag_data(all_data, num_of_lags),
+                 method = "lm", 
+                 trControl = fitControl_fixedWindow,
+                 tuneGrid  = expand.grid(intercept = intcpt))
+
+rolling_LM_Model <- rolling_LM_Fit$finalModel
+rolling_LM_pred <- rolling_LM_Fit$pred$pred
+#rolling_LM_Fit
+lm_summary <- summary(rolling_LM_Model)
+sig_coef <- lm_summary$coefficients[which(lm_summary$coefficients[,4] < 0.05),]
+kable(sig_coef, caption = "Significant Coeffcients")
+```
+
+\pagebreak
+For a visual examiniation of the prediction, we plot the prediction results versus the actual sigma of the testing data. Even though linear regression model does a good job at predicting near the high volatilty regions, e.g. around 2016-02, it performs poorly when the actual volatlity is low. We also observe that for the high volatility day, the prediction of high volatility often lags by a small time window.    
+
+```{r}
+lm_plot <- ggplot() + 
+  geom_line(aes(testing$Date[-(1:num_of_lags)], 
+                rolling_LM_pred,
+                colour = "Rolling Linear Regression")) + 
+  geom_line(aes(testing$Date[-(1:num_of_lags)], 
+                testing$sigma[-(1:num_of_lags)],
+                colour = "Actual"
+                ),linetype=2) +
+  ylab(TeX("Volatility $\\times 10^{-6$} ")) + 
+  xlab("") + 
+  ggtitle("2015 Volatility with Linear Regression") + 
+  scale_colour_manual("", 
+                      breaks = c("Rolling Linear Regression",
+                                 "Actual"),
+                      values = c("red","blue")) + 
+  theme(legend.position = c(0.85,0.85)) +
+  ylim(-400,1000)
+
+lm_plot
+```
+
+\pagebreak
+
+## Rolling LASSO
+```{r}
+lagged_training <- lag_data(training,num_of_lags)
+
+fitControl_fixedWindow <- trainControl(method = "timeslice",
+                              initialWindow = dim(training)[1],
+                              horizon = 1,
+                              fixedWindow = TRUE,
+                              savePredictions = T)
+
+rolling_LASSO_Fit <- train(sigma ~ ., data = lag_data(training_and_validation, num_of_lags),
+                 method = "glmnet", 
+                 trControl = fitControl_fixedWindow,
+                 tuneGrid = data.frame(alpha = 1, lambda = seq(0,100,1)),
+                 intercept=intcpt)
+
+rolling_LASSO_Model <- rolling_LASSO_Fit$finalModel
+```
+
+Next we train and validate a LASSO linear regression model with no intercept. The penalization constant $\lambda$ is selected so that the RMSE (root-mean-squared-erro) is the smallest on the validation data set. After $\lambda$ is selected, we fit a LASSO model on the testing set, with the selected penalty constant. Visually, the LASSO regression model does a better job at flecting the overall trend of the market volatility, even though near the high volatility region the model underperforms. Again we observe that the prediction of high volatility lags by a couple of days.    
+
+```{r}
+# LASSO predictions
+new_fitControl_fixedWindow <- trainControl(method = "timeslice",
+                              initialWindow = dim(training_and_validation)[1],
+                              horizon = 1,
+                              fixedWindow = TRUE,
+                              savePredictions = T)
+
+rolling_LASSO_best_Fit <- train(sigma ~ ., data = lag_data(all_data, num_of_lags),
+                 method = "glmnet", 
+                 trControl = new_fitControl_fixedWindow,
+                 tuneGrid = data.frame(alpha = 1, lambda = rolling_LASSO_Fit$bestTune$lambda),
+                 intercept=intcpt)
+
+rolling_LASSO_pred <- rolling_LASSO_best_Fit$pred$pred
+
+lasso_plot <- ggplot() + 
+  geom_line(aes(testing$Date[-(1:num_of_lags)], 
+                rolling_LASSO_pred,
+                colour = "Rolling LASSO Regression")) + 
+  geom_line(aes(testing$Date[-(1:num_of_lags)], 
+                testing$sigma[-(1:num_of_lags)],
+                colour = "Actual"),linetype=2) +
+  ylab(TeX("Volatility $\\times 10^{-6$} ")) + 
+  xlab("") + 
+  ggtitle("2015 Volatility with LASSO") + 
+  scale_colour_manual("", 
+                      breaks = c("Rolling LASSO Regression",
+                                 "Actual"),
+                      values = c("red","blue")) + 
+  theme(legend.position = c(0.85,0.85)) +
+  ylim(-400,1000)
+
+lasso_plot
+```
+
+## Features Selections by LASSO
+The LASSO regression shrinks the coeffcients of most features to zeros. For the final model, the selected feautures and their coeffcients are described in the following table. The historical volatility (sigma), unsurprisingly, has been selected by LASSO. Other interesting features are daily return and trend investing, which also appeared in the feature selection by \cite{xiong2015deep}. 
+```{r}
+lasso_coeff = coef(rolling_LASSO_Model, s = rolling_LASSO_Fit$bestTune$lambda)
+myResults <- data.frame(
+  features = lasso_coeff@Dimnames[[1]][ which(lasso_coeff != 0 ) ], #intercept included
+  coefs    = lasso_coeff              [ which(lasso_coeff != 0 ) ]  #intercept included
+)
+kable(myResults, caption = "Selected Features by LASSO")
+nonzero_coeff_names = as.character(myResults$features)
+```
+
+## Models Comparision 
+To compare our mode quantatively, we compute two scoring metrics, RMSE and MAE(mean-absolute-error). The LASSO model performs better than the Linear Regression model in both terms.   
+```{r}
+testing_actual <- lag_data(testing,num_of_lags)$sigma
+accuracy_lasso <- forecast::accuracy(rolling_LASSO_pred, testing_actual)
+accuracy_lm <- forecast::accuracy(rolling_LM_pred, testing_actual)
+daily_accuracy <- as.data.frame(rbind(accuracy_lasso, 
+                                  accuracy_lm))
+rownames(daily_accuracy) <- c("LASSO", "Linear Regression")
+kable(round(daily_accuracy, 2)[-c(1,4:5)], caption = "Daily Realized Variance Prediction Performance")
+
+```
+
+\pagebreak
+
+# Summary and Future Work
+This project indicates promise in applying rolling regression scheme to predcit market volatility. Future work awaits to be done on using different time lags when fitting the models. \cite{xiong2015deep} provides an optimal normalization observation and scheme, which could be studied further as a continuation fo this project. Another observation worth noting is that our prediction of high volatility often lags by a small time window. This was also reflected in the prediction results of \cite{xiong2015deep}. However at this point we are unsure if this is a characteristics of our models. 
+
+# Reflection
+Predicting any financial market quantity is a daunting task, given the highly volatile nature of the markets. Google search trends have served as our macroeconomics indicator in this project, yet there are other data from financial instruments that could be used, such as EuroDollars, Nasdaq, etc.   
+
+
+\pagebreak
+
+# Bibliography
+
+#Appendix
+```{r ref.label=knitr::all_labels(), echo = T, eval = F}
+```
